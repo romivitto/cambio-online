@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAMBIO</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#092e22;color:#f3fff6;font-family:Arial,sans-serif;text-align:center;padding:24px}
+main{max-width:650px;margin:auto}
+h1{font-size:48px;letter-spacing:8px;color:#a7f3b2;margin:12px}
+.panel{background:#124634;padding:20px;border-radius:18px;margin:18px 0}
+input,button{padding:12px;border:0;border-radius:10px;font-size:16px;margin:5px}
+input{max-width:100%;width:220px}
+button{background:#a7f3b2;color:#092e22;font-weight:bold;cursor:pointer}
+button:disabled{opacity:.4;cursor:not-allowed}
+.card{display:inline-flex;align-items:center;justify-content:center;background:#fff;color:#123b2a;border-radius:12px;width:58px;height:82px;margin:5px;font-size:22px;font-weight:bold;box-shadow:0 3px 8px #0005}
+.back{background:#1c7951;color:white}
+.small{font-size:13px;color:#c5e8d0}
+#game{display:none}
+#players{display:flex;flex-wrap:wrap;justify-content:center;gap:8px}
+.player{background:#1b6247;border-radius:12px;padding:12px;min-width:110px}
+.active{outline:3px solid #a7f3b2}
+#message{min-height:28px;color:#c6ffc9}
+</style>
+</head>
+<body>
+<main>
+<h1>CAMBIO</h1>
+<p>El objetivo es terminar con la menor puntuación.</p>
+
+<section class="panel" id="lobby">
+  <h2>Bienvenido a CAMBIO</h2>
+  <input id="name" placeholder="Tu nombre" maxlength="16">
+  <p><button onclick="createRoom()">Crear sala</button></p>
+  <p class="small">O únete a una sala existente:</p>
+  <input id="roomCode" placeholder="Código de sala">
+  <button onclick="joinRoom()">Unirme</button>
+  <p id="status"></p>
+  <div id="roomInfo"></div>
+  <div id="waitingPlayers"></div>
+  <button id="startBtn" onclick="startGame()" style="display:none">Empezar partida</button>
+</section>
+
+<section class="panel" id="game">
+  <h2>Partida</h2>
+  <p id="turn"></p>
+  <div id="players"></div>
+  <h3>Tus cartas</h3>
+  <p class="small">Al inicio puedes mirar dos cartas. ¡Recuerda sus valores!</p>
+  <div id="hand"></div>
+  <p id="message"></p>
+  <div id="actions">
+    <button onclick="drawCard()">Robar carta</button>
+    <button onclick="callCambio()">¡CAMBIO!</button>
+  </div>
+  <div id="drawnArea"></div>
+  <button onclick="peekCard()">Mirar una carta</button>
+  <button onclick="leaveGame()">Salir</button>
+</section>
+</main>
+
+<script>
+let peer, host=false, hostId=null, myId=null, myName="";
+let connections={}, players=[], deck=[], discard=[];
+let turnIndex=0, gameStarted=false, drawn=null, cambioBy=null, extraTurns=0;
+let revealed={}, pendingSwap=false;
+
+const $=id=>document.getElementById(id);
+function say(t){$("status").textContent=t}
+function cardValue(c){return c==="K"?0:c==="J"||c==="Q"?10:Number(c)}
+function makeDeck(){
+ let d=[];
+ ["♠","♥","♦","♣"].forEach(s=>{
+  ["A","2","3","4","5","6","7","8","9","10","J","Q","K"].forEach(v=>d.push({v,s}))
+ });
+ return d.sort(()=>Math.random()-.5);
+}
+function shuffle(d){return d.sort(()=>Math.random()-.5)}
+function createRoom(){
+ myName=$("name").value.trim()||"Jugador 1";
+ host=true;
+ peer=new Peer();
+ say("Creando sala...");
+ peer.on("open",id=>{
+  myId=id;hostId=id;
+  players=[{id,name:myName,hand:[],connected:true}];
+  $("roomInfo").innerHTML="Código de sala: <b>"+id+"</b><br>Compártelo con tus amigos.";
+  $("startBtn").style.display="inline-block";
+  say("Sala creada. ¡Esperando jugadores!");
+  renderLobby();
+ });
+ peer.on("connection",conn=>{
+  conn.on("data",data=>{
+   if(data.type==="join"){
+    if(players.length>=6||gameStarted){
+     conn.send({type:"error",message:"La sala está llena o la partida ya comenzó."});return;
+    }
+    if(players.some(p=>p.id===conn.peer))return;
+    players.push({id:conn.peer,name:String(data.name||"Jugador").slice(0,16),hand:[],connected:true});
+    connections[conn.peer]=conn;
+    conn.send({type:"joined",id:conn.peer});
+    broadcastLobby();renderLobby();
+   }else handleHostAction(conn.peer,data);
+  });
+  conn.on("close",()=>{});
+ });
+ peer.on("error",e=>say("Error: "+e.type));
+}
+function joinRoom(){
+ myName=$("name").value.trim()||"Jugador";
+ hostId=$("roomCode").value.trim();
+ if(!hostId){say("Escribe el código de sala.");return}
+ peer=new Peer();
+ say("Conectando...");
+ peer.on("open",id=>{
+  myId=id;
+  const conn=peer.connect(hostId);
+  conn.on("open",()=>conn.send({type:"join",name:myName}));
+  conn.on("data",data=>handleGuestMessage(data));
+  conn.on("error",()=>say("No se pudo conectar."));
+  connections.host=conn;
+ });
+ peer.on("error",e=>say("No se pudo conectar: "+e.type));
+}
+function broadcastLobby(){
+ Object.values(connections).forEach(c=>c.send({type:"lobby",players:players.map(p=>({name:p.name}))}));
+}
+function renderLobby(){
+ $("waitingPlayers").innerHTML=players.map(p=>"<p>🟢 "+escapeHtml(p.name)+"</p>").join("");
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function handleGuestMessage(d){
+ if(d.type==="error"){say(d.message);return}
+ if(d.type==="joined"){say("¡Te uniste a la sala!");return}
+ if(d.type==="lobby"){ $("waitingPlayers").innerHTML=d.players.map(p=>"<p>🟢 "+escapeHtml(p.name)+"</p>").join("");return}
+ if(d.type==="state")renderState(d.state);
+ if(d.type==="started"){$("lobby").style.display="none";$("game").style.display="block";renderState(d.state)}
+ if(d.type==="ended")say(d.message);
+}
+function startGame(){
+ if(!host||players.length<2){say("Necesitan al menos 2 jugadores.");return}
+ deck=makeDeck();discard=[];
+ players.forEach(p=>{p.hand=deck.splice(0,4)});
+ turnIndex=0;gameStarted=true;drawn=null;cambioBy=null;extraTurns=0;
+ revealed={};
+ players.forEach(p=>revealed[p.id]=[0,1]);
+ $("lobby").style.display="none";$("game").style.display="block";
+ sendStates();
+}
+function current(){return players[turnIndex]}
+function personalized(p){
+ return {
+  players:players.map((x,i)=>({name:x.name,count:x.hand.length,active:i===turnIndex})),
+  hand:p.hand.map((c,i)=>({card:revealed[p.id]?.includes(i)?c:null,index:i})),
+  turn:current().name, myTurn:p.id===current().id,
+  discard:discard[discard.length-1]||null,
+  drawn:p.id===myId?drawn:null,
+  cambioBy:cambioBy?players.find(x=>x.id===cambioBy)?.name:null
+ };
+}
+function sendStates(){
+ players.forEach(p=>{
+  const state=personalized(p);
+  if(p.id===myId)renderState(state);
+  else if(connections[p.id])connections[p.id].send({type:"state",state});
+ });
+}
+function renderState(s){
+ $("game").style.display="block";
+ $("turn").textContent="Turno de: "+s.turn+(s.myTurn?" — ¡te toca!":"");
+ $("players").innerHTML=s.players.map(p=>`<div class="player ${p.active?"active":""}">${escapeHtml(p.name)}<br><span class="small">${p.count} cartas</span></div>`).join("");
+ $("hand").innerHTML=s.hand.map(x=>`<button class="card ${x.card?"":"back"}" onclick="selectCard(${x.index})">${x.card?x.card.v+x.card.s:"?"}</button>`).join("");
+ $("message").textContent=s.cambioBy?s.cambioBy+" anunció CAMBIO. Última ronda.":"";
+ $("drawnArea").innerHTML=s.drawn?`<p>Carta robada: <span class="card">${s.drawn.v+s.drawn.s}</span></p><button onclick="keepDrawn()">Cambiar una carta</button><button onclick="discardDrawn()">Descartar y terminar turno</button>`:"";
+}
+function handleHostAction(id,d){
+ if(!gameStarted)return;
+ const p=players.find(x=>x.id===id);
+ if(!p)return;
+ if(d.type==="draw"&&p.id===current().id&&!drawn){
+  drawn=deck.pop();if(!drawn){finishGame();return}
+  sendStates();
+ }else if(d.type==="discard"&&p.id===current().id&&drawn){
+  discard.push(drawn);drawn=null;nextTurn();
+ }else if(d.type==="swap"&&p.id===current().id&&drawn&&d.index>=0&&d.index<4){
+  discard.push(p.hand[d.index]);p.hand[d.index]=drawn;drawn=null;
+  revealed[p.id]=(revealed[p.id]||[]).filter(i=>i!==d.index);nextTurn();
+ }else if(d.type==="peek"&&p.id===current().id&&d.index>=0&&d.index<4){
+  revealed[p.id]=[...(revealed[p.id]||[]),d.index];sendStates();
+ }else if(d.type==="cambio"&&p.id===current().id&&!cambioBy){
+  cambioBy=id;extraTurns=players.length-1;nextTurn();
+ }
+}
+function sendAction(d){
+ if(host)handleHostAction(myId,d);
+ else connections.host?.send(d);
+}
+function drawCard(){if(!host&&myId===null)return;sendAction({type:"draw"})}
+function discardDrawn(){sendAction({type:"discard"})}
+function keepDrawn(){say("Elige una de tus cartas para cambiarla.")}
+function selectCard(i){sendAction({type:"swap",index:i})}
+function peekCard(){
+ let n=prompt("¿Qué número de carta quieres mirar? (1 a 4)");
+ n=Number(n)-1;
+ if(Number.isInteger(n)&&n>=0&&n<4)sendAction({type:"peek",index:n});
+}
+function callCambio(){sendAction({type:"cambio"})}
+function nextTurn(){
+ if(cambioBy){
+  extraTurns--;
+  if(extraTurns<=0){finishGame();return}
+ }
+ turnIndex=(turnIndex+1)%players.length;
+ drawn=null;sendStates();
+}
+function finishGame(){
+ let scores=players.map(p=>({name:p.name,score:p.hand.reduce((a,c)=>a+cardValue(c.v),0)})).sort((a,b)=>a.score-b.score);
+ const msg="¡Fin de la partida! "+scores.map(x=>x.name+": "+x.score+" puntos").join(" | ");
+ $("message").textContent=msg;
+ Object.values(connections).forEach(c=>c.send({type:"ended",message:msg}));
+ gameStarted=false;
+}
+function leaveGame(){location.reload()}
+</script>
+</body>
+</html>
